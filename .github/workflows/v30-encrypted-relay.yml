@@ -1,0 +1,83 @@
+name: v30 encrypted relay
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/v30-encrypted-relay.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download capture bundle from the short-lived source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p payload/raw-main payload/raw-map payload/logs
+          base='https://erp-rug-thumbnail-holds.trycloudflare.com'
+          curl -fL --retry 5 --retry-delay 2 "$base/raw-main/main.webm" -o payload/raw-main/main.webm
+          curl -fL --retry 5 --retry-delay 2 "$base/raw-map/map.webm" -o payload/raw-map/map.webm
+          curl -fL --retry 5 --retry-delay 2 "$base/logs/record-main.log" -o payload/logs/record-main.log
+          curl -fL --retry 5 --retry-delay 2 "$base/logs/record-map.log" -o payload/logs/record-map.log
+          curl -fL --retry 5 --retry-delay 2 "$base/logs/spot-measure.log" -o payload/logs/spot-measure.log
+          curl -fL --retry 5 --retry-delay 2 "$base/SHA256SUMS" -o payload/SHA256SUMS
+          find payload -type f -printf '%P\t%s\n' | sort | tee payload/FILES.tsv
+          test "$(stat -c%s payload/raw-main/main.webm)" -gt 10000000
+          test "$(stat -c%s payload/raw-map/map.webm)" -gt 500000
+
+      - name: Encrypt for the requesting workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > recipient-cert.pem <<'CERT'
+          -----BEGIN CERTIFICATE-----
+          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
+          Y4fvVRBeWRRwoeHT9Q==
+          -----END CERTIFICATE-----
+          CERT
+          tar -C payload -czf capture.tar.gz .
+          openssl cms -encrypt -binary -aes-256-cbc -outform DER \
+            -in capture.tar.gz -out capture.tar.gz.p7m recipient-cert.pem
+          sha256sum capture.tar.gz.p7m > capture.tar.gz.p7m.sha256
+          stat -c '%n %s bytes' capture.tar.gz.p7m
+
+      - name: Upload encrypted relay artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arop-v30-encrypted-capture
+          path: |
+            capture.tar.gz.p7m
+            capture.tar.gz.p7m.sha256
+          retention-days: 1
+          if-no-files-found: error
