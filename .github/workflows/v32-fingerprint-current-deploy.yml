@@ -1,0 +1,61 @@
+name: v32 fingerprint current deployment
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-fingerprint-current-deploy.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Download all index-declared chunks and scan latest-main fingerprints
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p bundle/assets
+          base='http://poonge.iptime.org:9200'
+          curl -fL --connect-timeout 8 --max-time 30 "$base/operations/live?tab=overview" -o bundle/index.html
+          grep -Eo '/assets/[^" ]+\.(js|css)' bundle/index.html | sort -u > bundle/asset-paths.txt
+          while IFS= read -r path; do
+            curl -fL --connect-timeout 8 --max-time 60 "$base$path" -o "bundle/${path#/}"
+          done < bundle/asset-paths.txt
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          needles = [
+            'map-camera-dock-notlive',
+            'NOT LIVE VIDEO',
+            'Sample Revision',
+            'event-feed-scope-note',
+            '현재 선택한 사이트의 기록이 아닙니다',
+            'settings-showcase-toggle',
+            'data-map-view-mode',
+            'STRUCTURAL_3D',
+            'WO-2026-0711-009',
+            'GRP-FNG-2026-0081',
+          ]
+          files = [p for p in Path('bundle').rglob('*') if p.is_file()]
+          result = {}
+          for needle in needles:
+            raw = needle.encode('utf-8')
+            result[needle] = [str(p) for p in files if raw in p.read_bytes()]
+          Path('fingerprint-scan.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          PY
+          sha256sum bundle/assets/* bundle/index.html > bundle/SHA256SUMS.txt
+      - name: Upload fingerprints
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-current-deploy-fingerprint
+          path: |
+            fingerprint-scan.json
+            bundle/asset-paths.txt
+            bundle/SHA256SUMS.txt
+          retention-days: 1
+          if-no-files-found: error
