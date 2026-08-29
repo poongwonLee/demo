@@ -1,0 +1,152 @@
+name: v32 direct product dry run
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-direct-dryrun.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install Playwright
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p work/raw work/evidence
+          cd work
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.55.0
+          npx playwright install chromium
+      - name: Record direct product interaction dry run
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd work
+          cat > direct-dryrun.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { performance } from 'node:perf_hooks';
+
+          const BASE = 'http://poonge.iptime.org:9200';
+          const out = path.resolve('evidence');
+          const raw = path.resolve('raw');
+          fs.mkdirSync(out,{recursive:true}); fs.mkdirSync(raw,{recursive:true});
+          const browser = await chromium.launch({ headless: true, args:['--no-sandbox','--disable-dev-shm-usage'] });
+
+          async function dismissWelcome(page){
+            const later=page.getByTestId('first-run-later');
+            if(await later.count() && await later.isVisible().catch(()=>false)){ await later.click(); await page.waitForTimeout(350); }
+          }
+          async function preflight(){
+            const c=await browser.newContext({viewport:{width:1920,height:1080},deviceScaleFactor:1,locale:'ko-KR',colorScheme:'light'});
+            const p=await c.newPage();
+            await p.goto(BASE+'/settings',{waitUntil:'domcontentloaded',timeout:90000});
+            await p.waitForTimeout(1000); await dismissWelcome(p);
+            const toggle=p.getByTestId('settings-showcase-toggle'); await toggle.waitFor({state:'visible',timeout:30000});
+            if((await toggle.getAttribute('data-on'))==='true'){ await toggle.click(); await p.waitForTimeout(500); }
+            if((await toggle.getAttribute('data-on'))!=='false') throw new Error('preflight failed to set Showcase OFF');
+            await c.storageState({path:'preflight-state.json'}); await c.close();
+          }
+          await preflight();
+
+          const context=await browser.newContext({viewport:{width:1920,height:1080},recordVideo:{dir:raw,size:{width:1920,height:1080}},storageState:'preflight-state.json',deviceScaleFactor:1,locale:'ko-KR',colorScheme:'light'});
+          const page=await context.newPage();
+          const t0=performance.now();
+          const events=[]; const errors=[]; const clicks=[];
+          page.on('console',m=>{if(m.type()==='error') errors.push({at:(performance.now()-t0)/1000,type:'console',text:m.text()})});
+          page.on('pageerror',e=>errors.push({at:(performance.now()-t0)/1000,type:'pageerror',text:e.message}));
+          const now=()=>+((performance.now()-t0)/1000).toFixed(3);
+          const safeText=async loc=>(await loc.innerText().catch(()=>'' )).trim().replace(/\s+/g,' ').slice(0,800);
+          async function box(loc){ const b=await loc.boundingBox().catch(()=>null); return b?Object.fromEntries(Object.entries(b).map(([k,v])=>[k,+v.toFixed(2)])):null; }
+          async function attrs(loc){ return await loc.evaluate(el=>({tag:el.tagName.toLowerCase(),testid:el.getAttribute('data-testid'),actionId:el.getAttribute('data-action-id'),scenarioTarget:el.getAttribute('data-scenario-target'),mapViewMode:el.getAttribute('data-map-view-mode'),requestState:el.getAttribute('data-request-state'),effectState:el.getAttribute('data-effect-state'),commandState:el.getAttribute('data-command-state'),dataOn:el.getAttribute('data-on'),ariaChecked:el.getAttribute('aria-checked'),disabled:'disabled' in el?el.disabled:null,value:'value' in el?String(el.value):null})).catch(()=>null); }
+          async function record(id,loc=null,extra={}){ const rec={id,at:now(),url:new URL(page.url()).pathname+new URL(page.url()).search,...extra}; if(loc){rec.text=await safeText(loc);rec.bounds=await box(loc);rec.attrs=await attrs(loc);} events.push(rec); return rec; }
+          async function shot(id){ await page.screenshot({path:path.join(out,`${String(events.length).padStart(3,'0')}-${id}.png`),fullPage:false}); }
+          async function dwell(ms=700){ await page.waitForTimeout(ms); }
+          async function click(id,loc,wait=650){ await loc.waitFor({state:'visible',timeout:30000}); await loc.scrollIntoViewIfNeeded(); const pre=await record(id+'-before',loc); clicks.push({id,at:now(),url:pre.url,selector:pre.attrs?.testid?`[data-testid="${pre.attrs.testid}"]`:pre.attrs?.actionId?`[data-action-id="${pre.attrs.actionId}"]`:null,bounds:pre.bounds}); await loc.click(); await dwell(wait); await record(id+'-after',loc).catch(()=>{}); await shot(id); }
+          async function textRange(id,rootLoc,needle){ const result=await rootLoc.evaluate((root,needle)=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let n;while(n=w.nextNode()){const i=n.nodeValue?.indexOf(needle)??-1;if(i>=0){const r=document.createRange();r.setStart(n,i);r.setEnd(n,i+needle.length);const b=r.getBoundingClientRect();return {x:b.x,y:b.y,width:b.width,height:b.height,text:needle};}}return null;},needle).catch(()=>null); events.push({id,at:now(),url:new URL(page.url()).pathname+new URL(page.url()).search,bounds:result?{x:+result.x.toFixed(2),y:+result.y.toFixed(2),width:+result.width.toFixed(2),height:+result.height.toFixed(2)}:null,text:needle,kind:'text-range'}); return result; }
+          async function byTestOrAction(testid,action){ const a=page.getByTestId(testid); if(await a.count()) return a.first(); return page.locator(`[data-action-id="${action}"]`).first(); }
+
+          await page.goto(BASE+'/settings',{waitUntil:'domcontentloaded',timeout:90000}); await dwell(1000); await dismissWelcome(page);
+          const showcase=page.getByTestId('settings-showcase-toggle'); await record('showcase-off-state',showcase,{expected:'OFF'}); await shot('showcase-off');
+          await click('showcase-on-click',showcase,700); if((await showcase.getAttribute('data-on'))!=='true') throw new Error('Showcase ON did not apply'); await record('showcase-on-state',showcase,{expected:'ON'}); await dwell(900);
+
+          await click('nav-operations',page.getByTestId('nav-operations'),600);
+          await click('ops-tab-map',page.getByTestId('ops-tab-map'),650);
+          await click('map-view-3d',page.getByTestId('map-view-3d'),700);
+          const structural=page.getByTestId('structural-map-view'); await structural.waitFor({state:'visible',timeout:30000});
+          if((await structural.getAttribute('data-map-view-mode'))!=='STRUCTURAL_3D') throw new Error('Structural 3D assertion failed');
+          if(page.url().includes('view=2d')) throw new Error('2D URL exposed');
+          await record('structural-3d-state',structural,{mapViewMode:'STRUCTURAL_3D'}); await textRange('map-robot-wld-label',structural,'WLD-W01-01'); await shot('structural-3d'); await dwell(900);
+
+          await click('nav-incidents',page.getByTestId('nav-incidents'),650);
+          await click('incident-row',page.getByTestId('incident-row-INC-UC01-0008'),700);
+          const inspector=page.getByTestId('incident-inspector'); await inspector.waitFor({state:'visible',timeout:30000});
+          const force=page.getByTestId('incident-force-policy'); await record('incident-force-policy',force); await textRange('grip-force-threshold-30',force,'30%'); await textRange('grip-force-measurement-28',force,'28%'); await shot('incident-force');
+          const owner=page.getByTestId('incident-inspector-assign-select'); await owner.selectOption({label:'김안전'}); await dwell(350); await record('owner-selected',owner); await shot('owner-selected');
+          await click('assign-owner',page.getByTestId('incident-inspector-assign'),650); await record('assigned-owner-result',page.getByTestId('incident-assigned-owner')); await dwell(500);
+          await click('ack-incident',page.getByTestId('incident-ack'),650); await record('ack-result',page.getByTestId('incident-state')); await dwell(650);
+          await click('open-robot-monitor',page.getByTestId('incident-open-monitor'),700);
+
+          await click('camera-tab',page.locator('[data-action-id="robots.workspace.tab-cameras"]'),650);
+          const cameras=page.getByTestId('cameras-workspace'); await cameras.waitFor({state:'visible',timeout:30000}); await record('robot-cameras',cameras); await click('camera-channel-2',page.getByTestId('workspace-camera-channel-2'),500); await dwell(600);
+          await click('remote-tab',page.locator('[data-action-id="robots.workspace.tab-remote"]'),700);
+          await click('lease-open',page.locator('[data-action-id="robots.workspace.rail-request-lease"]'),450);
+          const leaseSheet=page.getByTestId('sheet-controller-lock'); await leaseSheet.waitFor({state:'visible',timeout:20000}); const reason=leaseSheet.locator('textarea'); await reason.fill('32차 직접 조작 검증'); await record('lease-reason',reason); await shot('lease-reason');
+          await click('lease-request',page.getByTestId('workspace-lock-request'),500);
+          await click('lease-approve',page.getByTestId('workspace-lock-approve'),700);
+          const controller=page.locator('[data-scenario-target="robots.workspace.controller-request"]'); await controller.waitFor({state:'visible',timeout:20000}); await record('single-controller-result',controller); await shot('lease-applied');
+          const closeLease=page.locator('[data-action-id="robots.workspace.sheet-lock-cancel"]'); if(await closeLease.count()&&await closeLease.isVisible()) await click('lease-sheet-close',closeLease,400);
+
+          const deadman=page.getByTestId('deadman-hold'); await deadman.waitFor({state:'visible',timeout:30000}); await deadman.scrollIntoViewIfNeeded(); await deadman.hover(); await record('deadman-before',deadman); const deadStart=now(); await page.mouse.down(); events.push({id:'deadman-mousedown',at:deadStart,url:new URL(page.url()).pathname+new URL(page.url()).search,bounds:await box(deadman)}); await page.waitForTimeout(1450); await page.mouse.up(); const deadEnd=now(); events.push({id:'deadman-mouseup',at:deadEnd,url:new URL(page.url()).pathname+new URL(page.url()).search,heldMs:+((deadEnd-deadStart)*1000).toFixed(0),bounds:await box(deadman)}); await dwell(650); await shot('deadman-release');
+          await click('emergency-stop',page.locator('[data-action-id="robots.workspace.rail-emergency-stop"]'),850);
+          const lifecycle=page.locator('[data-scenario-target="robots.workspace.command-lifecycle"]'); await lifecycle.waitFor({state:'visible',timeout:20000}); const lifeText=await safeText(lifecycle); await record('stop-acked-applied-evidence',lifecycle,{lifeText}); if(!/STOP/i.test(lifeText)||!/ACKED/i.test(lifeText)||!/MOCK_EFFECT_APPLIED/i.test(lifeText)) throw new Error('STOP lifecycle evidence incomplete: '+lifeText); await shot('stop-evidence'); await dwell(700);
+
+          await click('nav-incidents-analytics',page.getByTestId('nav-incidents'),500); await click('analytics-tab',page.getByTestId('lnb-incidents-analytics'),650);
+          const cyc=page.getByTestId('analytics-cycle-time'); const fpy=page.getByTestId('analytics-fpy'); await record('analytics-cycle-time',cyc); await textRange('cycle-46',cyc,'46초'); await textRange('cycle-71',cyc,'71초'); await record('analytics-fpy',fpy); await textRange('fpy-98.4',fpy,'98.4%'); await textRange('fpy-66.7',fpy,'66.7%'); await shot('analytics-values'); await dwell(700);
+
+          await click('nav-hardware',page.getByTestId('nav-hardware'),600); const hwLink=page.getByTestId('lnb-hardware-hardware'); if(await hwLink.count()&&await hwLink.isVisible()) await click('hardware-lnb',hwLink,500);
+          await click('hardware-gripper-card',page.getByTestId('hardware-card-WLD-W01-01-GRIPPER-01'),600); const openDetail=page.getByTestId('hardware-open-detail-WLD-W01-01-GRIPPER-01'); if(await openDetail.count()&&await openDetail.isVisible()) await click('hardware-open-detail',openDetail,650);
+          const rulDetail=page.getByTestId('rul-detail-btn'); if(await rulDetail.count()&&await rulDetail.isVisible()) await click('rul-detail-open',rulDetail,500);
+          const remain=page.getByTestId('remaining-211-cycles'); const days=page.getByTestId('replacement-date-14-days'); await record('rul-design-211',remain); await record('rul-analysis-14-days',days); await shot('rul-values');
+          await click('publish-recommendation',page.getByTestId('analysis-publish-recommendation'),700); const pub=page.getByTestId('analysis-recommendation-state'); if(await pub.count()) await record('recommendation-published',pub); await dwell(600);
+
+          const maintLink=page.getByTestId('lnb-hardware-maintenance'); if(!(await maintLink.count())||!(await maintLink.isVisible())){ await click('nav-hardware-maint',page.getByTestId('nav-hardware'),300); }
+          await click('maintenance-link',page.getByTestId('lnb-hardware-maintenance'),650);
+          await click('maintenance-policy-run',page.getByTestId('run-maintenance-policy'),800); const policy=page.getByTestId('maintenance-policy-eight-conditions'); await policy.waitFor({state:'visible',timeout:20000}); await record('maintenance-8-of-8',policy); await shot('maintenance-8-of-8');
+          await click('create-work-order',page.getByTestId('create-work-order'),800); const wo=page.getByTestId('work-order-detail-WO-2026-0711-009'); await wo.waitFor({state:'visible',timeout:20000}); await record('work-order-created',wo); await shot('work-order-created');
+
+          await click('inventory-tab',page.getByTestId('maint-tab-inventory'),650); await click('inventory-item',page.getByTestId('inventory-item-GRP-FNG-2026-0081'),650); const inv=page.getByTestId('inventory-detail-GRP-FNG-2026-0081'); await inv.waitFor({state:'visible',timeout:20000}); await record('finger-inventory',inv); const received=page.getByTestId('inventory-received-date'); if(await received.count()) await record('inventory-received-date',received); await shot('finger-inventory');
+
+          await click('plan-tab',page.getByTestId('maint-tab-plan'),650); await click('work-order-detail-open',page.getByTestId('work-order-detail-WO-2026-0711-009'),550);
+          const assignee=page.getByTestId('wo-assignee'); await assignee.click(); await dwell(250); let opt=page.getByRole('option',{name:/박정비/}); if(!(await opt.count())) opt=page.getByRole('option').last(); await opt.click(); await dwell(300); await record('wo-assignee-selected',assignee); await shot('wo-assignee');
+          await click('wo-assign',page.getByTestId('wo-assign'),650); await click('wo-start',page.getByTestId('wo-start'),650); await click('wo-complete-open',page.getByTestId('wo-complete-open'),500);
+          const completion=page.getByTestId('wo-complete-sheet'); await completion.waitFor({state:'visible',timeout:20000}); const serial=page.getByTestId('wo-new-serial'); await serial.fill('GRP-FNG-2026-0081'); await record('serial-filled',serial); await shot('serial-filled');
+          for(const gate of ['procedure','safety','inventory','calibration','visual','operation']){ const cb=page.getByTestId(`wo-verification-gate-${gate}`); await cb.click(); await dwell(180); await record(`gate-${gate}-checked`,cb); }
+          await record('six-gates-ready',completion); await shot('six-gates-ready'); await click('wo-complete-confirm',page.getByTestId('wo-complete-confirm'),900); await record('wo-completed',page.getByTestId('work-order-detail-WO-2026-0711-009')); await dwell(500);
+          await click('history-tab',page.getByTestId('maint-tab-history'),700); const hist=page.getByTestId('replacement-history'); await hist.waitFor({state:'visible',timeout:20000}); await record('replacement-history',hist); await textRange('history-new-row',hist,'2026-07-11 22:40'); await textRange('history-new-serial',hist,'GRP-SN-2026-0142 → GRP-FNG-2026-0081'); await shot('replacement-history'); await dwell(1800);
+
+          const video=page.video(); await context.close(); const src=await video.path(); fs.copyFileSync(src,path.join(raw,'v32-direct-dryrun.webm'));
+          const result={base:BASE,viewport:{width:1920,height:1080},startedAt:new Date().toISOString(),duration:+now().toFixed(3),events,clicks,errors,scenarioClicks:clicks.filter(x=>/scenario/i.test(x.id+' '+(x.selector||''))),assertions:{showcaseOffOn:true,structural3d:true,view2dExposed:false,deadmanHeldMs:+((deadEnd-deadStart)*1000).toFixed(0),stopEvidence:lifeText,noScenarioUi:clicks.every(x=>!/scenario/i.test(x.id+' '+(x.selector||'')))}};
+          fs.writeFileSync(path.join(out,'direct-product-cues-dryrun.json'),JSON.stringify(result,null,2)); await browser.close();
+          JS
+          node direct-dryrun.mjs
+          ffprobe -v error -show_entries format=duration -show_entries stream=index,codec_name,width,height,r_frame_rate,pix_fmt -of json raw/v32-direct-dryrun.webm > evidence/ffprobe.json
+          sha256sum raw/v32-direct-dryrun.webm evidence/* > evidence/SHA256SUMS.txt
+      - name: Upload direct dry run
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-direct-dryrun
+          path: |
+            work/raw/v32-direct-dryrun.webm
+            work/evidence/
+            work/direct-dryrun.mjs
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
