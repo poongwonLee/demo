@@ -1,0 +1,139 @@
+name: v32 direct product DOM reconnaissance
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-dom-recon.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Prepare Playwright
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p work/recon
+          cd work
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.55.0
+          command -v google-chrome || command -v google-chrome-stable || command -v chromium || true
+      - name: Inspect actual product surfaces
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd work
+          cat > recon.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const base = 'http://poonge.iptime.org:9200';
+          const out = path.resolve('recon');
+          fs.mkdirSync(out, { recursive: true });
+          const executablePath = fs.existsSync('/usr/bin/google-chrome') ? '/usr/bin/google-chrome' :
+            fs.existsSync('/usr/bin/google-chrome-stable') ? '/usr/bin/google-chrome-stable' :
+            fs.existsSync('/usr/bin/chromium') ? '/usr/bin/chromium' : undefined;
+          const browser = await chromium.launch({ headless: true, executablePath, args: ['--no-sandbox','--disable-dev-shm-usage'] });
+          const context = await browser.newContext({ viewport: { width: 1920, height: 1080 }, deviceScaleFactor: 1, locale: 'ko-KR', colorScheme: 'light' });
+          const page = await context.newPage();
+          const consoleErrors = [];
+          page.on('console', msg => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
+          page.on('pageerror', err => consoleErrors.push(`PAGEERROR ${err.message}`));
+
+          const routes = [
+            ['root','/'],
+            ['settings','/settings'],
+            ['operations-overview','/operations/live?tab=overview'],
+            ['operations-map','/operations/live?tab=map'],
+            ['operations-map-3d','/operations/live?tab=map&view=3d'],
+            ['incidents','/incidents?tab=center&view=main'],
+            ['incident-detail','/incidents/INC-UC01-0008?tab=overview'],
+            ['robot-overview','/robots/WLD-W01-01/workspace?view=overview'],
+            ['robot-cameras','/robots/WLD-W01-01/workspace?view=cameras&source=monitor'],
+            ['robot-remote','/robots/WLD-W01-01/workspace?view=remote'],
+            ['analytics','/incidents?tab=analytics&view=main'],
+            ['hardware','/hardware'],
+            ['gripper','/hardware/WLD-W01-01/components/GRIPPER-01?tab=overview'],
+            ['maintenance-plan','/maintenance?tab=plan'],
+            ['maintenance-inventory','/maintenance?tab=inventory'],
+            ['maintenance-history','/maintenance?tab=history'],
+          ];
+
+          const records = [];
+          for (const [name, route] of routes) {
+            await page.goto(base + route, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            await page.waitForTimeout(1600);
+            await page.screenshot({ path: path.join(out, `${name}.png`), fullPage: false });
+            const data = await page.evaluate(() => {
+              const visible = el => {
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+              };
+              const info = el => {
+                const r = el.getBoundingClientRect();
+                return {
+                  tag: el.tagName.toLowerCase(),
+                  text: (el.innerText || el.textContent || '').trim().replace(/\s+/g,' ').slice(0,240),
+                  role: el.getAttribute('role'),
+                  ariaLabel: el.getAttribute('aria-label'),
+                  title: el.getAttribute('title'),
+                  href: el.getAttribute('href'),
+                  testid: el.getAttribute('data-testid'),
+                  actionId: el.getAttribute('data-action-id'),
+                  scenarioTarget: el.getAttribute('data-scenario-target'),
+                  mapViewMode: el.getAttribute('data-map-view-mode'),
+                  requestState: el.getAttribute('data-request-state'),
+                  effectState: el.getAttribute('data-effect-state'),
+                  commandState: el.getAttribute('data-command-state'),
+                  checked: 'checked' in el ? el.checked : null,
+                  disabled: 'disabled' in el ? el.disabled : null,
+                  value: 'value' in el ? String(el.value).slice(0,160) : null,
+                  bounds: { x:r.x, y:r.y, width:r.width, height:r.height },
+                };
+              };
+              const selectors = 'a,button,input,select,textarea,[role],[data-testid],[data-action-id],[data-scenario-target],[data-map-view-mode],[data-request-state],[data-effect-state],[data-command-state]';
+              return {
+                url: location.pathname + location.search + location.hash,
+                title: document.title,
+                bodyText: (document.body.innerText || '').replace(/\s+\n/g,'\n').slice(0,30000),
+                htmlData: { ...document.documentElement.dataset },
+                bodyData: { ...document.body.dataset },
+                localStorage: Object.fromEntries(Object.entries(localStorage)),
+                sessionStorage: Object.fromEntries(Object.entries(sessionStorage)),
+                elements: [...document.querySelectorAll(selectors)].filter(visible).map(info),
+              };
+            });
+            records.push({ name, route, ...data });
+          }
+          fs.writeFileSync(path.join(out,'dom-recon.json'), JSON.stringify({ base, viewport:{width:1920,height:1080}, records, consoleErrors }, null, 2));
+          await browser.close();
+          JS
+          node recon.mjs
+          python3 - <<'PY'
+          import json
+          d=json.load(open('recon/dom-recon.json',encoding='utf-8'))
+          for r in d['records']:
+              print('\n###',r['name'],r['url'])
+              for e in r['elements']:
+                  if e.get('testid') or e.get('actionId') or e.get('mapViewMode') or e.get('href'):
+                      print(e.get('tag'), 'text=',e.get('text','')[:80], 'testid=',e.get('testid'), 'action=',e.get('actionId'), 'mode=',e.get('mapViewMode'), 'href=',e.get('href'))
+          print('consoleErrors',len(d['consoleErrors']))
+          PY
+          tar -czf v32-dom-recon.tar.gz recon
+          sha256sum v32-dom-recon.tar.gz > v32-dom-recon.tar.gz.sha256
+      - name: Upload DOM reconnaissance
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-dom-recon
+          path: |
+            work/v32-dom-recon.tar.gz
+            work/v32-dom-recon.tar.gz.sha256
+          retention-days: 1
+          if-no-files-found: error
