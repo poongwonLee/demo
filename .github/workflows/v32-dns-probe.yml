@@ -1,0 +1,27 @@
+name: v32 deployment DNS probe
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-dns-probe.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Resolve and probe
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          getent ahostsv4 poonge.iptime.org | tee dns.txt
+          curl -sS -L --connect-timeout 8 --max-time 20 -o /dev/null -w 'remote_ip=%{remote_ip} http=%{http_code}\n' 'http://poonge.iptime.org:9200/operations/live?tab=overview' | tee -a dns.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v32-deployment-dns
+          path: dns.txt
+          retention-days: 1
