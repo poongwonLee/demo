@@ -1,0 +1,40 @@
+name: v32 Playwright Chromium runtime
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-playwright-runtime.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Playwright Chromium and ffmpeg
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p work
+          cd work
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright@1.55.0
+          npx playwright install chromium
+          find "$HOME/.cache/ms-playwright" -maxdepth 4 -type f \( -name chrome -o -name headless_shell -o -name ffmpeg \) -printf '%p %s bytes\n' | tee runtime-files.txt
+          tar -C "$HOME/.cache" -czf playwright-runtime-linux-x64.tar.gz ms-playwright
+          sha256sum playwright-runtime-linux-x64.tar.gz > playwright-runtime-linux-x64.tar.gz.sha256
+          du -sh playwright-runtime-linux-x64.tar.gz
+      - name: Upload runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-playwright-runtime-linux-x64
+          path: |
+            work/playwright-runtime-linux-x64.tar.gz
+            work/playwright-runtime-linux-x64.tar.gz.sha256
+            work/runtime-files.txt
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
