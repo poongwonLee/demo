@@ -1,0 +1,37 @@
+name: v32 deployment metadata probe
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-deployment-info.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch deployment metadata and application shell
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p probe
+          base='http://poonge.iptime.org:9200'
+          for path in DEPLOYMENT_INFO.json deployment-info.json version.json build-info.json manifest.json; do
+            safe=$(printf '%s' "$path" | tr '/?' '__')
+            curl -sS -L --connect-timeout 8 --max-time 20 -D "probe/${safe}.headers" -o "probe/${safe}" -w '%{http_code}\n' "$base/$path" > "probe/${safe}.status" || true
+          done
+          curl -fL --connect-timeout 8 --max-time 30 "$base/operations/live?tab=overview" -o probe/index.html
+          grep -Eo 'assets/[^" ]+\.(js|css|woff2?|png|svg)' probe/index.html | sort -u > probe/index-assets.txt || true
+          sha256sum probe/* > probe/SHA256SUMS.txt
+          find probe -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+      - name: Upload metadata evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-deployment-metadata
+          path: probe/
+          retention-days: 1
+          if-no-files-found: error
