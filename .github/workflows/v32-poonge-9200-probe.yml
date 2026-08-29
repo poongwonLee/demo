@@ -1,0 +1,35 @@
+name: v32 poonge 9200 probe
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-poonge-9200-probe.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe product endpoint
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p probe
+          curl -fL --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 30 \
+            -D probe/headers.txt \
+            'http://poonge.iptime.org:9200/operations/live?tab=overview' \
+            -o probe/index.html
+          grep -Eo 'assets/[^" ]+\.(js|css)' probe/index.html | sort -u | tee probe/assets.txt
+          wc -c probe/index.html
+          sha256sum probe/* > probe/SHA256SUMS.txt
+      - name: Upload endpoint evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-poonge-9200-probe
+          path: probe/
+          retention-days: 1
+          if-no-files-found: error
