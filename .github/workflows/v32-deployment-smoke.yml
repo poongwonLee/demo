@@ -1,0 +1,36 @@
+name: v32 deployment and runner smoke
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-deployment-smoke.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe deployed latest-main product
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p smoke
+          date -u +%FT%TZ | tee smoke/time.txt
+          curl -fL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+            -D smoke/headers.txt \
+            'http://123.37.41.201:9000/operations/live?tab=overview' \
+            -o smoke/index.html
+          grep -Eo 'assets/[^" ]+\.(js|css)' smoke/index.html | sort -u | tee smoke/assets.txt
+          wc -c smoke/index.html
+          sha256sum smoke/* > smoke/SHA256SUMS.txt
+      - name: Upload smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-deployment-smoke
+          path: smoke/
+          retention-days: 1
+          if-no-files-found: error
