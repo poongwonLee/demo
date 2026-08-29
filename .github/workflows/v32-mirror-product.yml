@@ -1,0 +1,134 @@
+name: v32 mirror current product bundle
+
+on:
+  push:
+    branches: ['gpt-pro/v32-direct-capture-relay']
+    paths: ['.github/workflows/v32-mirror-product.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Recursively mirror the deployed SPA bundle
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import mimetypes
+          import os
+          import re
+          import urllib.parse
+          import urllib.request
+          from collections import deque
+          from pathlib import Path
+
+          base = 'http://poonge.iptime.org:9200/'
+          out = Path('site')
+          out.mkdir(parents=True, exist_ok=True)
+          queue = deque(['index.html'])
+          seen = set()
+          records = []
+          asset_re = re.compile(rb'(?:["\'`(=]|url\()(/?(?:assets|models|fonts|images|public)/[^"\'`()\s?#]+)')
+
+          def fetch(rel: str):
+              rel = rel.lstrip('/')
+              url = urllib.parse.urljoin(base, rel)
+              req = urllib.request.Request(url, headers={'User-Agent': 'aROP-v32-bundle-mirror'})
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  data = r.read()
+                  ctype = r.headers.get_content_type()
+                  status = r.status
+              path = out / rel
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+              records.append({
+                  'path': rel,
+                  'url': url,
+                  'status': status,
+                  'contentType': ctype,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+              })
+              return data, ctype
+
+          while queue:
+              rel = queue.popleft()
+              if rel in seen:
+                  continue
+              seen.add(rel)
+              try:
+                  data, ctype = fetch(rel)
+              except Exception as exc:
+                  records.append({'path': rel, 'error': repr(exc)})
+                  continue
+              textual = ctype.startswith('text/') or rel.endswith(('.js', '.css', '.html', '.json', '.svg'))
+              if textual:
+                  for raw in asset_re.findall(data):
+                      child = raw.decode('utf-8', errors='ignore').lstrip('/')
+                      if child and child not in seen:
+                          queue.append(child)
+
+          # Save root app route as index for local history fallback.
+          app_url = urllib.parse.urljoin(base, 'operations/live?tab=overview')
+          req = urllib.request.Request(app_url, headers={'User-Agent': 'aROP-v32-bundle-mirror'})
+          with urllib.request.urlopen(req, timeout=90) as r:
+              route_html = r.read()
+          (out / 'operations-live.html').write_bytes(route_html)
+
+          manifest = {
+              'base': base,
+              'fetchedCount': sum(1 for r in records if 'sha256' in r),
+              'errorCount': sum(1 for r in records if 'error' in r),
+              'files': records,
+          }
+          Path('mirror-manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          needles = [
+              'map-camera-dock-notlive',
+              'NOT LIVE VIDEO',
+              'Sample Revision',
+              'event-feed-scope-note',
+              '현재 선택한 사이트의 기록이 아닙니다',
+              'settings-showcase-toggle',
+              'data-map-view-mode',
+              'STRUCTURAL_3D',
+              'WO-2026-0711-009',
+              'GRP-FNG-2026-0081',
+          ]
+          scan = {}
+          for needle in needles:
+              hits = []
+              n = needle.encode('utf-8')
+              for p in out.rglob('*'):
+                  if p.is_file():
+                      try:
+                          data = p.read_bytes()
+                      except OSError:
+                          continue
+                      if n in data:
+                          hits.append(str(p.relative_to(out)))
+              scan[needle] = hits
+          Path('fingerprint-scan.json').write_text(json.dumps(scan, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps({'fetched': manifest['fetchedCount'], 'errors': manifest['errorCount'], 'fingerprints': scan}, ensure_ascii=False, indent=2))
+          PY
+          tar -czf v32-product-mirror.tar.gz site mirror-manifest.json fingerprint-scan.json
+          sha256sum v32-product-mirror.tar.gz > v32-product-mirror.tar.gz.sha256
+          du -sh site v32-product-mirror.tar.gz
+      - name: Upload mirrored product bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: v32-product-mirror
+          path: |
+            v32-product-mirror.tar.gz
+            v32-product-mirror.tar.gz.sha256
+            mirror-manifest.json
+            fingerprint-scan.json
+          retention-days: 1
+          if-no-files-found: error
