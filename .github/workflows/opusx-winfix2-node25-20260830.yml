@@ -44,7 +44,7 @@ jobs:
           $payloadArchive = Join-Path $env:RUNNER_TEMP 'opusx-winfix2-project.tar.gz'
           [IO.File]::WriteAllBytes($payloadArchive, [Convert]::FromBase64String($payloadBase64))
           $payloadHash = (Get-FileHash $payloadArchive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($payloadHash -ne 'dd8ca8d6e9649dc973563316b57fbab939ac28a2b8e326817276f69b6acd9675') {
+          if ($payloadHash -ne 'a714df9edf197706ab641f003f6798813676b6b9ff3c96c1f0da10888c656668') {
             throw "Payload SHA-256 mismatch: $payloadHash"
           }
 
@@ -156,9 +156,10 @@ jobs:
               $screen = Join-Path $evidence 'first-screen-windows-node25-winfix2.png'
               $dom = Join-Path $evidence 'first-screen-windows-node25-winfix2.html'
               $profile = Join-Path $env:RUNNER_TEMP 'edge-winfix2-profile'
+              $profileDom = Join-Path $env:RUNNER_TEMP 'edge-winfix2-profile-dom'
               & $browser '--headless=new' '--disable-gpu' '--no-sandbox' "--user-data-dir=$profile" '--window-size=1440,900' "--screenshot=$screen" "http://127.0.0.1:$port/"
               if ($LASTEXITCODE -ne 0) { throw "Browser screenshot failed: $LASTEXITCODE" }
-              & $browser '--headless=new' '--disable-gpu' '--no-sandbox' "--user-data-dir=$profile-dom" '--dump-dom' "http://127.0.0.1:$port/" | Set-Content -Encoding UTF8 $dom
+              & $browser '--headless=new' '--disable-gpu' '--no-sandbox' "--user-data-dir=$profileDom" '--dump-dom' "http://127.0.0.1:$port/" | Set-Content -Encoding UTF8 $dom
               if ($LASTEXITCODE -ne 0) { throw "Browser DOM dump failed: $LASTEXITCODE" }
               $screenBytes = (Get-Item $screen).Length
               $domText = Get-Content $dom -Raw
