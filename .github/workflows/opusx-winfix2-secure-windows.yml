@@ -1,0 +1,254 @@
+name: OPUS-X winfix2 secure Windows Node 25.8.1 validation
+
+on:
+  push:
+    branches:
+      - ci/opusx-winfix2-secure-20260830
+    paths:
+      - '.github/workflows/opusx-winfix2-secure-windows.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-node25-secure-reopen:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/opusx-winfix2-secure-20260830
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 25.8.1
+
+      - name: Generate one-time key, receive encrypted project, and run every Windows gate
+        id: validate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $branch = 'ci/opusx-winfix2-secure-20260830'
+          $exchange = Join-Path $env:GITHUB_WORKSPACE 'secure-exchange'
+          $evidence = Join-Path $env:GITHUB_WORKSPACE 'windows-evidence'
+          Remove-Item $exchange -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item $evidence -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $exchange, $evidence | Out-Null
+
+          function Convert-ToPem([string]$Label, [byte[]]$Bytes) {
+            $base64 = [Convert]::ToBase64String($Bytes)
+            $lines = @()
+            for ($offset = 0; $offset -lt $base64.Length; $offset += 64) {
+              $lines += $base64.Substring($offset, [Math]::Min(64, $base64.Length - $offset))
+            }
+            return "-----BEGIN $Label-----`n$($lines -join "`n")`n-----END $Label-----`n"
+          }
+
+          function Get-RemoteText([string]$Path) {
+            $spec = "origin/${branch}:$Path"
+            $value = & git show $spec 2>$null
+            if ($LASTEXITCODE -ne 0) { throw "Unable to read $Path from $branch" }
+            return ($value -join "`n").Trim()
+          }
+
+          $rsa = [System.Security.Cryptography.RSA]::Create(4096)
+          $requestId = [Guid]::NewGuid().ToString('N')
+          $publicPem = Convert-ToPem 'PUBLIC KEY' $rsa.ExportSubjectPublicKeyInfo()
+          Set-Content -LiteralPath (Join-Path $exchange 'public-key.pem') -Value $publicPem -Encoding ascii -NoNewline
+          [ordered]@{
+            request_id = $requestId
+            run_id = $env:GITHUB_RUN_ID
+            run_attempt = $env:GITHUB_RUN_ATTEMPT
+            node = 'v25.8.1'
+            algorithm = 'RSA-OAEP-SHA256 + AES-256-GCM'
+            created_utc = [DateTime]::UtcNow.ToString('o')
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $exchange 'request.json') -Encoding utf8
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add secure-exchange/public-key.pem secure-exchange/request.json
+          git commit -m "Publish one-time OPUS-X winfix2 validation key $requestId"
+          git push origin "HEAD:$branch"
+
+          $manifest = $null
+          for ($attempt = 0; $attempt -lt 240; $attempt++) {
+            git fetch origin $branch --quiet
+            $raw = & git show "origin/${branch}:secure-exchange/manifest.json" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $raw) {
+              try {
+                $candidate = (($raw -join "`n") | ConvertFrom-Json)
+                if ($candidate.request_id -eq $requestId) {
+                  $manifest = $candidate
+                  break
+                }
+              } catch {}
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $manifest) { throw "Timed out waiting for encrypted payload for request $requestId" }
+
+          $wrappedKey = [Convert]::FromBase64String((Get-RemoteText 'secure-exchange/wrapped-key.b64'))
+          $nonce = [Convert]::FromBase64String((Get-RemoteText 'secure-exchange/nonce.b64'))
+          $tag = [Convert]::FromBase64String((Get-RemoteText 'secure-exchange/tag.b64'))
+          $payloadBase64 = ''
+          foreach ($chunk in $manifest.chunks) {
+            $payloadBase64 += Get-RemoteText ("secure-exchange/" + $chunk)
+          }
+          $ciphertext = [Convert]::FromBase64String($payloadBase64)
+          $key = $rsa.Decrypt($wrappedKey, [System.Security.Cryptography.RSAEncryptionPadding]::OaepSHA256)
+          $plaintext = New-Object byte[] $ciphertext.Length
+          $aad = [Text.Encoding]::UTF8.GetBytes([string]$manifest.aad)
+          $aes = [System.Security.Cryptography.AesGcm]::new($key, $tag.Length)
+          try {
+            $aes.Decrypt($nonce, $ciphertext, $tag, $plaintext, $aad)
+          } finally {
+            $aes.Dispose()
+            [Array]::Clear($key, 0, $key.Length)
+          }
+          $actualPayloadHash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($plaintext)).ToLowerInvariant()
+          if ($actualPayloadHash -ne [string]$manifest.plaintext_sha256) {
+            throw "Payload SHA-256 mismatch: $actualPayloadHash"
+          }
+          if ($plaintext.Length -ne [int64]$manifest.plaintext_bytes) {
+            throw "Payload byte count mismatch: $($plaintext.Length)"
+          }
+
+          $archive = Join-Path $env:RUNNER_TEMP 'opusx-winfix2-project.tar.xz'
+          [IO.File]::WriteAllBytes($archive, $plaintext)
+          $unpacked = Join-Path $env:RUNNER_TEMP 'opusx-winfix2-unpacked'
+          Remove-Item $unpacked -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $unpacked | Out-Null
+          & tar.exe -xf $archive -C $unpacked
+          if ($LASTEXITCODE -ne 0) { throw "tar.exe extraction failed: $LASTEXITCODE" }
+
+          $packageFile = Get-ChildItem $unpacked -Recurse -Filter package.json |
+            Where-Object { $_.FullName -notmatch '[\\/]node_modules[\\/]' } |
+            Sort-Object { $_.FullName.Length } |
+            Select-Object -First 1
+          if (-not $packageFile) { throw 'No project package.json found after decrypt/extract.' }
+
+          $externalParent = Join-Path $env:RUNNER_TEMP 'Fresh Windows Folder With Spaces'
+          $external = Join-Path $externalParent 'OPUS X TX360 winfix2 Node 25.8.1'
+          Remove-Item $externalParent -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $external | Out-Null
+          & robocopy.exe $packageFile.Directory.FullName $external /MIR /XD node_modules dist dist-lib .git /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "robocopy.exe failed: $LASTEXITCODE" }
+
+          $result = [ordered]@{
+            request_id = $requestId
+            node = (& node.exe --version).Trim()
+            npm = (& npm.cmd --version).Trim()
+            runner_os = $env:RUNNER_OS
+            image_os = $env:ImageOS
+            external_folder = $external
+            payload_sha256 = $actualPayloadHash
+            payload_bytes = $plaintext.Length
+            workflow_run_id = $env:GITHUB_RUN_ID
+            workflow_run_attempt = $env:GITHUB_RUN_ATTEMPT
+            gates = @()
+          }
+          if ($result.node -ne 'v25.8.1') { throw "Unexpected Node version: $($result.node)" }
+
+          function Run-Gate([string]$Name, [string]$CommandLine) {
+            $logPath = Join-Path $evidence ($Name + '.log')
+            $started = Get-Date
+            & cmd.exe /d /s /c $CommandLine 2>&1 | Tee-Object -FilePath $logPath
+            $exitCode = $LASTEXITCODE
+            $result.gates += [ordered]@{
+              name = $Name
+              command = $CommandLine
+              exit_code = $exitCode
+              duration_seconds = [Math]::Round(((Get-Date) - $started).TotalSeconds, 3)
+              log = [IO.Path]::GetFileName($logPath)
+            }
+            if ($exitCode -ne 0) { throw "$Name failed with exit code $exitCode" }
+          }
+
+          Push-Location $external
+          try {
+            Run-Gate '01-ci' 'npm.cmd ci --no-audit --no-fund'
+            Run-Gate '02-windows-esm-contract' 'npm.cmd run check:windows-esm'
+            Run-Gate '03-typecheck' 'npm.cmd run typecheck'
+            Run-Gate '04-lint' 'npm.cmd run lint'
+            Run-Gate '05-test' 'npm.cmd run test'
+            Run-Gate '06-build' 'npm.cmd run build'
+
+            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+            $listener.Start()
+            $port = $listener.LocalEndpoint.Port
+            $listener.Stop()
+            $stdout = Join-Path $evidence '07-dev.stdout.log'
+            $stderr = Join-Path $evidence '07-dev.stderr.log'
+            $devStarted = Get-Date
+            $dev = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d','/s','/c',"npm.cmd run dev -- --host 127.0.0.1 --port $port") -WorkingDirectory $external -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+            try {
+              $response = $null
+              for ($i = 0; $i -lt 180; $i++) {
+                Start-Sleep -Milliseconds 500
+                try {
+                  $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port/" -TimeoutSec 2
+                  if ($response.StatusCode -eq 200 -and $response.Content -match 'id="root"') { break }
+                } catch { $response = $null }
+                if ($dev.HasExited) { break }
+              }
+              if (-not $response -or $response.StatusCode -ne 200) { throw 'Dev server did not return HTTP 200.' }
+
+              $browserPaths = @(
+                "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+                "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+                "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+                "$env:ProgramFiles(x86)\Google\Chrome\Application\chrome.exe"
+              )
+              $browser = $browserPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if (-not $browser) { throw 'No installed Edge/Chrome executable found.' }
+              $screen = Join-Path $evidence 'first-screen-windows-node25-winfix2.png'
+              $dom = Join-Path $evidence 'first-screen-windows-node25-winfix2.html'
+              $profileA = Join-Path $env:RUNNER_TEMP 'edge-winfix2-screen-profile'
+              $profileB = Join-Path $env:RUNNER_TEMP 'edge-winfix2-dom-profile'
+              & $browser '--headless=new' '--disable-gpu' '--no-sandbox' "--user-data-dir=$profileA" '--window-size=1440,900' "--screenshot=$screen" "http://127.0.0.1:$port/"
+              if ($LASTEXITCODE -ne 0) { throw "Browser screenshot failed: $LASTEXITCODE" }
+              & $browser '--headless=new' '--disable-gpu' '--no-sandbox' "--user-data-dir=$profileB" '--dump-dom' "http://127.0.0.1:$port/" | Set-Content -LiteralPath $dom -Encoding utf8
+              if ($LASTEXITCODE -ne 0) { throw "Browser DOM dump failed: $LASTEXITCODE" }
+              $screenBytes = (Get-Item $screen).Length
+              $domText = Get-Content -LiteralPath $dom -Raw
+              if ($screenBytes -lt 10000) { throw "Screenshot too small: $screenBytes" }
+              if ($domText.Length -lt 1000 -or $domText -notmatch 'id="root"' -or $domText -match 'fatal-error') {
+                throw 'Rendered first-screen DOM verification failed.'
+              }
+              $result.gates += [ordered]@{
+                name = '07-dev-first-screen-browser'
+                command = "npm.cmd run dev -- --host 127.0.0.1 --port $port; Edge/Chrome headless"
+                exit_code = 0
+                duration_seconds = [Math]::Round(((Get-Date) - $devStarted).TotalSeconds, 3)
+                port = $port
+                browser = $browser
+                http_status = $response.StatusCode
+                screenshot_bytes = $screenBytes
+                screenshot_sha256 = (Get-FileHash $screen -Algorithm SHA256).Hash.ToLowerInvariant()
+                dom_bytes = (Get-Item $dom).Length
+              }
+            } finally {
+              if ($dev -and -not $dev.HasExited) { & taskkill.exe /PID $dev.Id /T /F | Out-Null }
+            }
+          } finally {
+            Pop-Location
+          }
+
+          $result.all_passed = @($result.gates | Where-Object { $_.exit_code -ne 0 }).Count -eq 0
+          $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $evidence 'windows-validation-winfix2.json') -Encoding utf8
+          Copy-Item (Join-Path $external 'scripts\import-utils.mjs') (Join-Path $evidence 'import-utils.mjs.txt')
+          Copy-Item (Join-Path $external 'scripts\common.mjs') (Join-Path $evidence 'common.mjs.txt')
+          Copy-Item (Join-Path $external 'scripts\build.mjs') (Join-Path $evidence 'build.mjs.txt')
+          Copy-Item (Join-Path $external 'scripts\typecheck.mjs') (Join-Path $evidence 'typecheck.mjs.txt')
+          Copy-Item (Join-Path $external 'scripts\lint.mjs') (Join-Path $evidence 'lint.mjs.txt')
+          if (-not $result.all_passed) { throw 'Windows validation did not pass.' }
+
+      - name: Upload Windows validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opusx-winfix2-windows-node25-evidence
+          path: windows-evidence
+          if-no-files-found: warn
+          retention-days: 30
